@@ -1,0 +1,469 @@
+---
+title: "Parkinson's Disease Progression Prediction with Random Forests"
+output: html_notebook
+---
+
+```{r set-up: packages}
+library(magrittr)
+
+```
+
+```{r set-up: ggplot options}
+
+ggplot2::theme_set(
+  ggthemes::theme_tufte() +
+    ggplot2::theme(legend.position = "bottom",
+                   legend.text = ggplot2::element_text(size = 14),
+                   legend.key.size = ggplot2::unit(1.5, "cm")))
+
+```
+
+```{r load data: clinical data sets}
+clinical <- readr::read_csv(
+  here::here("Data", "Raw", "train_clinical_data.csv"),
+  col_types = readr::cols(
+    visit_id = readr::col_character(),
+    patient_id = readr::col_character(),
+    upd23b_clinical_state_on_medication = readr::col_factor(
+      levels = c("Off", "On"),
+      include_na = FALSE),
+    .default = readr::col_double()
+  ), show_col_types = FALSE, progress = FALSE) %>%
+  dplyr::rename(On_Off = upd23b_clinical_state_on_medication)
+
+clinical_supp <- readr::read_csv(
+  here::here("Data","Raw","supplemental_clinical_data.csv"),
+  col_types = readr::cols(
+    visit_id = readr::col_character(),
+    patient_id = readr::col_character(),
+    upd23b_clinical_state_on_medication = readr::col_factor(
+      levels = c("Off", "On"),
+      include_na = FALSE),
+    .default = readr::col_double()
+  ), show_col_types = FALSE, progress = FALSE)  %>%
+  dplyr::rename(On_Off = upd23b_clinical_state_on_medication)
+
+```
+
+```{r load data: laboratory data}
+peptides <- 
+  readr::read_csv(
+    here::here("Data", "Raw", "train_peptides.csv"),
+    col_types = readr::cols(
+      visit_id = readr::col_character(),
+      patient_id = readr::col_character(),
+      UniProt = readr::col_character(),
+      Peptide = readr::col_character(),
+      PeptideAbundance = readr::col_double()),
+    show_col_types = FALSE, 
+    progress = FALSE)
+
+proteins <- 
+  readr::read_csv(
+    here::here("Data", "Raw", "train_proteins.csv"),
+    col_types = readr::cols(
+      visit_id = readr::col_character(),
+      patient_id = readr::col_character(),
+      UniProt = readr::col_character(),
+      NPX = readr::col_double()),
+    show_col_types = FALSE,
+    progress = FALSE)
+```
+
+```{r save prepared data to use on other notebooks}
+#save.image(here::here("Data", "Interim", "loaded_data_sets.RData"))
+
+```
+
+# Exploratory Data Analysis
+
+```{r data set dimensions}
+data_set_shape <- function(.dataset, .first_rows = FALSE) {
+  .dataset_name <- deparse(substitute(.dataset))
+  .n_rows <- prettyNum(nrow(.dataset), big.mark = ",")
+  
+  .n_cols <- prettyNum(ncol(.dataset), big.mark = ",")
+  
+  .msg_1 <- glue::glue_col("Data set: {red {.dataset_name}}; shape: ") 
+  .msg_2 <- glue::glue_col("{blue {.n_rows}};{blue {.n_cols}}")
+  
+  .msg_full <- glue::glue_col("{.msg_1} {.msg_2}")
+  
+  print(.msg_full)
+  
+  if (.first_rows) print(head(.dataset, 5))
+}
+
+data_set_shape(clinical)
+data_set_shape(clinical_supp)
+data_set_shape(peptides)
+data_set_shape(proteins)
+```
+
+```{r first rows: clinical}
+clinical %>%
+head() %>%
+  print()
+```
+
+```{r first rows: proteins}
+proteins %>%
+head() %>%
+  print()
+```
+
+```{r proteins per visit}
+# Average number of proteins measured per visit
+proteins %>%
+  dplyr::group_by(visit_id) %>%
+  dplyr::count() %>%
+  dplyr::ungroup() %>%
+  dplyr::pull(n) %>%
+  mean()
+
+```
+
+```{r first rows: peptides}
+peptides %>%
+head() %>%
+  print()
+```
+
+```{r peptides per protein}
+peptides %>%
+  dplyr::distinct(UniProt, Peptide) %>%
+  dplyr::group_by(UniProt) %>%
+  dplyr::count() %>%
+  dplyr::pull(n) %>%
+  mean()
+
+```
+
+```{r visualisation: Change in updr across visits, fig.align='center', fig.height=15, fig.width=20}
+min_num_visits <- 15
+
+pt_id_pool <- 
+  clinical %>% 
+  dplyr::group_by(patient_id) %>%
+  dplyr::count() %>%
+  dplyr::arrange(dplyr::desc(n)) %>%
+  dplyr::filter(n >= min_num_visits) %>%
+  dplyr::pull(patient_id)
+
+# Reproducible random subset of patients
+set.seed(13)
+pt_ids <- sample(pt_id_pool, size = 16, replace = FALSE)
+
+clinical %>%
+  dplyr::filter(patient_id %in% pt_ids) %>%
+  tidyr::pivot_longer(cols = -c(visit_id, patient_id, visit_month, On_Off),
+                      names_to = "updrs", values_to = "updrs_score") %>%
+  ggplot2::ggplot(
+    mapping = ggplot2::aes(
+      x = visit_month, 
+      y = updrs_score,
+      colour = updrs,
+      group = updrs)) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point() +
+  ggplot2::facet_wrap(~patient_id)
+
+
+rm(min_num_visits, pt_id_pool,pt_ids)
+```
+
+```{r visualisation: protein expression visit: 0, fig.align='center', fig.height=15, fig.width=20}
+proteins %>%
+  dplyr::filter(visit_month == 0) %>%
+  ggplot2::ggplot(
+    mapping = ggplot2::aes(
+      x = patient_id, 
+      y = UniProt, 
+      fill = NPX)) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_flip() +
+  ggplot2::scale_y_discrete(position = "right") +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45))
+```
+
+```{r visualisation: protein expression visit: 3, fig.align='center', fig.height=15, fig.width=20}
+proteins %>%
+  dplyr::filter(visit_month == 3) %>%
+  ggplot2::ggplot(
+    mapping = ggplot2::aes(
+      x = patient_id, 
+      y = UniProt, 
+      fill = NPX)) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_flip() +
+  ggplot2::scale_y_discrete(position = "right") +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45))
+```
+
+```{r visualisation: protein expression visit: 6, fig.align='center', fig.height=15, fig.width=20}
+proteins %>%
+  dplyr::filter(visit_month == 6) %>%
+  ggplot2::ggplot(
+    mapping = ggplot2::aes(
+      x = patient_id, 
+      y = UniProt, 
+      fill = NPX)) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_flip() +
+  ggplot2::scale_y_discrete(position = "right") +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45))
+```
+
+```{r visualisation: protein expression visit: 12, fig.align='center', fig.height=15, fig.width=20}
+proteins %>%
+  dplyr::filter(visit_month == 12) %>%
+  ggplot2::ggplot(
+    mapping = ggplot2::aes(
+      x = patient_id, 
+      y = UniProt, 
+      fill = NPX)) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_flip() +
+  ggplot2::scale_y_discrete(position = "right") +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45))
+```
+
+```{r visualisation: protein expression visit: 18, fig.align='center', fig.height=15, fig.width=20}
+proteins %>%
+  dplyr::filter(visit_month == 18) %>%
+  ggplot2::ggplot(
+    mapping = ggplot2::aes(
+      x = patient_id, 
+      y = UniProt, 
+      fill = NPX)) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_flip() +
+  ggplot2::scale_y_discrete(position = "right") +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45))
+```
+
+```{r visualisation: protein expression visit: 36, fig.align='center', fig.height=15, fig.width=20}
+proteins %>%
+  dplyr::filter(visit_month == 36) %>%
+  ggplot2::ggplot(
+    mapping = ggplot2::aes(
+      x = patient_id, 
+      y = UniProt, 
+      fill = NPX)) +
+  ggplot2::geom_raster() +
+  ggplot2::coord_flip() +
+  ggplot2::scale_y_discrete(position = "right") +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45))
+```
+
+# Baseline Model
+
+```{r Data Preparation - Pivot tables}
+# Group by visit ids and molecule ids. Get the average expression value
+prepare_pd_biochem_data <- function(.dataset, .molecule, .expLevel) {
+  .molecule_quo <- rlang::enquo(.molecule)
+  .expLevel_quo <- rlang::enquo(.expLevel)
+  
+  .dataset %>%
+    dplyr::group_by(visit_id, !!.molecule_quo) %>%
+    dplyr::summarise(!!.expLevel_quo := mean(!!.expLevel_quo, na.rm = TRUE),
+                     .groups = "drop") %>%
+    tidyr::pivot_wider(id_cols = visit_id, 
+                       names_from = !!.molecule_quo, 
+                       values_from = !!.expLevel_quo)
+}
+
+proteins_df <- prepare_pd_biochem_data(proteins, UniProt, NPX)
+peptides_df <- prepare_pd_biochem_data(peptides, Peptide, PeptideAbundance)
+```
+
+```{r Data Preparation - Merge tables}
+biochem_df <- dplyr::left_join(proteins_df, peptides_df, by = "visit_id")
+data_set_shape(biochem_df, .first_rows = TRUE)
+```
+
+```{r}
+train_df <- 
+  dplyr::select(clinical, 
+                visit_id, 
+                visit_month, 
+                updrs_1, updrs_2, updrs_3, updrs_4) %>%
+  dplyr::left_join(biochem_df, ., by = "visit_id")
+```
+
+```{r Modeling Recipe}
+use_cores <- ceiling(parallel::detectCores()/2)
+
+rf_model <-
+  parsnip::rand_forest(
+    mtry = tune::tune(),
+    trees = tune::tune(),
+    min_n = tune::tune()) %>%
+  parsnip::set_engine(engine = "ranger", 
+                      num.threads = use_cores,
+                      importance = "permutation") %>%
+  parsnip::set_mode("regression")
+
+updrs_1_rec <- 
+  recipes::recipe(updrs_1 ~ ., 
+                  data = dplyr::select(train_df, -c(updrs_2, updrs_3, updrs_4))) %>%
+  recipes::step_naomit(recipes::all_outcomes()) %>%
+  recipes::step_mutate_at(recipes::all_predictors(), fn = ~tidyr::replace_na(-1))
+updrs_2_rec <- 
+  recipes::recipe(updrs_2 ~ ., 
+                  data = dplyr::select(train_df, -c(updrs_1, updrs_3, updrs_4))) %>%
+  recipes::step_naomit(recipes::all_outcomes()) %>%
+  recipes::step_mutate_at(recipes::all_predictors(), fn = ~tidyr::replace_na(-1))
+updrs_3_rec <- 
+  recipes::recipe(updrs_3 ~ ., 
+                  data = dplyr::select(train_df, -c(updrs_1, updrs_2, updrs_4))) %>%
+  recipes::step_naomit(recipes::all_outcomes()) %>%
+  recipes::step_mutate_at(recipes::all_predictors(), fn = ~tidyr::replace_na(-1))
+updrs_4_rec <- 
+  recipes::recipe(updrs_4 ~ ., 
+                  data = dplyr::select(train_df, -c(updrs_1, updrs_2, updrs_3))) %>%
+  recipes::step_naomit(recipes::all_outcomes())%>%
+  recipes::step_mutate_at(recipes::all_predictors(), fn = ~tidyr::replace_na(-1))
+
+pd_wkflw_1 <- workflowsets::workflow_set(preproc = list(updrs_1 = updrs_1_rec,
+                                          updrs_2 = updrs_2_rec,
+                                          updrs_3 = updrs_3_rec,
+                                          updrs_4 = updrs_4_rec),
+                           models = list(rf_model),
+                           cross = TRUE)
+```
+
+```{r Model Screening}
+
+regression_metrics <- yardstick::metric_set(yardstick::rmse,
+                                            yardstick::smape)
+
+race_control <- finetune::control_race(save_pred     = TRUE, 
+                                       save_workflow = TRUE, 
+                                       parallel_over = "everything")
+
+kfold_cv_set <- rsample::vfold_cv(train_df, v = 10)
+
+fitted_models <- workflowsets::workflow_map(pd_wkflw_1,
+                                            fn = "tune_race_anova",
+                                            resamples = kfold_cv_set,
+                                            grid = 50,
+                                            metrics = regression_metrics,
+                                            control = race_control,
+                                            seed = 13)
+
+```
+
+```{r Ranked results}
+workflowsets::rank_results(fitted_models, select_best = TRUE, 
+                           rank_metric = "smape")
+```
+
+```{r Print Best Hyperparameters}
+best_hyperparameters <-
+  list(id = c("updrs_1_rand_forest",
+              "updrs_2_rand_forest",
+              "updrs_3_rand_forest",
+              "updrs_4_rand_forest"),
+       metric = "smape") %>%
+  purrr::pmap(function(id, metric, wkflwst) {
+    workflowsets::extract_workflow_set_result(wkflwst, id = id) %>%
+      tune::select_best(metric = metric)
+  }, wkflwst = fitted_models)
+
+best_hyperparameters %>%
+  purrr::pwalk(c("hyp_updrs_1_rand_forest.csv",
+                 "hyp_updrs_2_rand_forest.csv",
+                 "hyp_updrs_3_rand_forest.csv",
+                 "hyp_updrs_4_rand_forest.csv"),
+               function(.tbl, file_name) readr::write_csv(.tbl,
+                                                          path = here::here("Models", file_name)))
+purrr::walk(seq_along(best_hyperparameters),
+            function(i, best_hyperparameters) print(best_hyperparameters[[i]]),
+            best_hyperparameters = best_hyperparameters)
+```
+
+```{r Train-test split}
+
+pt_ids <- 
+  train_df %>%
+  dplyr::pull(visit_id) %>%
+  stringr::str_replace(pattern = "_\\d+$", replacement = "") %>%
+  unique()
+
+set.seed(13)
+tr_pt_ids <- sample(pt_ids,size = ceiling(length(pt_ids)*.80))
+
+X_train <- 
+  train_df %>%
+  dplyr::filter(stringr::str_replace(visit_id, 
+                                    pattern = "_\\d+$", 
+                                    replacement = "") %in% tr_pt_ids) 
+
+X_test <-
+  train_df %>%
+  dplyr::filter(!stringr::str_replace(visit_id, 
+                                    pattern = "_\\d+$", 
+                                    replacement = "") %in% tr_pt_ids) 
+```
+
+```{r Final Fit}
+Rf_fit_updrs_1 <- workflowsets::extract_workflow(fitted_models, id = "updrs_1_rand_forest") %>%
+  tune::finalize_workflow(best_hyperparameters[[1]]) %>%
+  parsnip::fit(X_train)
+
+Rf_fit_updrs_2 <- workflowsets::extract_workflow(fitted_models, id = "updrs_2_rand_forest") %>%
+  tune::finalize_workflow(best_hyperparameters[[2]]) %>%
+  parsnip::fit(X_train)
+
+Rf_fit_updrs_3 <- workflowsets::extract_workflow(fitted_models, id = "updrs_3_rand_forest") %>%
+  tune::finalize_workflow(best_hyperparameters[[3]]) %>%
+  parsnip::fit(X_train)
+
+Rf_fit_updrs_4 <- workflowsets::extract_workflow(fitted_models, id = "updrs_4_rand_forest") %>%
+  tune::finalize_workflow(best_hyperparameters[[4]]) %>%
+  parsnip::fit(X_train)
+
+```
+
+```{r Test Scores (smape)}
+list(pred_col = c("updrs_1_pred", "updrs_2_pred", "updrs_3_pred", "updrs_4_pred"),
+     model = list(Rf_fit_updrs_1, Rf_fit_updrs_2, Rf_fit_updrs_3, Rf_fit_updrs_4)
+     ) %>%
+  purrr::pmap_dfr(function(pred_col, 
+                           model, 
+                           test_data, 
+                           metrics) {
+    truth_col <- stringr::str_remove(pred_col, pattern = "_pred$")
+    truth_col <- rlang::sym(truth_col)
+    
+    test_data[[pred_col]] <- predict(model, new_data = test_data)[[1]]
+    pred_col <- rlang::sym(pred_col)
+    
+    metrics(test_data, truth = !!truth_col, estimate = !!pred_col) %>%
+      dplyr::filter(.metric == "smape")
+    
+    
+  },test_data = X_test, metrics = regression_metrics)
+```
+
+```{r Test Scores (rmse)}
+list(pred_col = c("updrs_1_pred", "updrs_2_pred", "updrs_3_pred", "updrs_4_pred"),
+     model = list(Rf_fit_updrs_1, Rf_fit_updrs_2, Rf_fit_updrs_3, Rf_fit_updrs_4)
+     ) %>%
+  purrr::pmap_dfr(function(pred_col, 
+                           model, 
+                           test_data, 
+                           metrics) {
+    truth_col <- stringr::str_remove(pred_col, pattern = "_pred$")
+    truth_col <- rlang::sym(truth_col)
+    
+    test_data[[pred_col]] <- predict(model, new_data = test_data)[[1]]
+    pred_col <- rlang::sym(pred_col)
+    
+    metrics(test_data, truth = !!truth_col, estimate = !!pred_col) %>%
+      dplyr::filter(.metric == "rmse")
+    
+    
+  },test_data = X_test, metrics = regression_metrics)
+```

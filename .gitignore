@@ -2,3 +2,13 @@
 .Rhistory
 .RData
 .Ruserdata
+
+# Keep subfolders to preserve structure, but ignore all actual data
+Data/External/*
+Data/Interim/*
+Data/Processed/*
+Data/Raw/*
+Data/Test/*
+
+# Keep timeseries api private
+Src/Python/timeseries_api
